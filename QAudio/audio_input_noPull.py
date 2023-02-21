@@ -1,0 +1,230 @@
+import sys
+from typing import Optional
+
+import PySide6
+from PySide6.QtCore import QByteArray, QMargins, Qt, Slot, qWarning
+from PySide6.QtGui import QPainter, QPalette
+from PySide6.QtMultimedia import (QAudio, QAudioDevice, QAudioFormat,
+                                  QAudioSource, QMediaDevices)
+from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout,
+                               QPushButton, QSlider, QVBoxLayout, QWidget)
+
+'''
+QMediaDevices → QAudioDevice
+QAudioSource(QAudioDevice, QAudioFormat)
+QAudioSource.start() → QIODevice
+'''
+class AudioInfo:
+    def __init__(self, format: QAudioFormat):
+        super().__init__()
+        self.bytes_per_sample: int = int(format.bytesPerSample())       # 一个采样的字节数
+        self.bytes_per_frame: int = int(format.bytesPerFrame())         # 一帧的字节数 = 一个采样的字节数 * 通道数
+        self.n_channels = format.channelCount()                         # 通道数
+        self.normalizedSampleValue = format.normalizedSampleValue       # 归一化到-1到1
+        self.sample_rate = format.sampleRate()                          # 采样频率
+
+
+    def calculate_level(self, data: bytes) -> float:
+        ''' 
+        data是音频
+        '''
+        n_bytes = len(data)
+        n_frames: int = int(n_bytes / self.bytes_per_frame)                   # 音频的总字节数 / 一帧的字节数 = 音频的总帧数
+
+        
+        # print(self.bytes_per_sample,self.bytes_per_frame,n_bytes , n_frames)
+
+
+        maxValue: float = 0
+        m_offset: int = 0
+
+        # 这样是为了交替声道
+        for i in range(n_frames):    # 遍历data的每帧
+            for j in range(self.n_channels):   # 遍历每个通道
+                # 某个声道音量
+                value = 0
+                if n_bytes > m_offset:
+                    data_sample = data[m_offset:]   # data从头到尾
+                    value = self.normalizedSampleValue(data_sample)
+                maxValue = max(value, maxValue)
+                # 加bytes_per_sample是对的，因为一帧的字节数 = 一个采样的字节数 * 通道数
+                m_offset = m_offset + self.bytes_per_sample
+        return maxValue
+
+class RenderArea(QWidget):
+    def __init__(self, parent: Optional[PySide6.QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent=parent)
+        self.m_level = 0
+
+        # 用白色填充背景
+        self.setBackgroundRole(QPalette.Base)
+        self.setAutoFillBackground(True)
+        
+        # 高宽
+        self.setMinimumHeight(30)   # 高度
+        self.setMinimumWidth(200)   # 宽度
+
+    def set_level(self, value):
+        self.m_level = value
+        self.update()
+
+    def paintEvent(self, event: PySide6.QtGui.QPaintEvent) -> None:
+        ### 
+        # 会自动调用
+        # 作用就是画个矩形框，矩形框里再填充红色矩形条
+        ###
+        with QPainter(self) as painter:
+            painter.setPen(Qt.black)
+            frame = painter.viewport() - QMargins(10, 10, 10, 10)
+
+            painter.drawRect(frame)
+
+            if self.m_level == 0.0:
+                return
+
+            pos: int = round((frame.width() - 1) * self.m_level)
+            painter.fillRect(
+                frame.left() + 1, frame.top() + 1, pos, frame.height() - 1, Qt.red
+            )
+
+
+
+class InputTest(QWidget):
+    # 音频格式
+    audio_format = QAudioFormat()
+    audio_format.setSampleRate(16000)     # 采样频率
+    audio_format.setChannelCount(1)       # 通道数
+    audio_format.setSampleFormat(QAudioFormat.Int16)  # 采样格式，QAudioFormat.UInt8，QAudioFormat.Int16
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.media_devices = QMediaDevices(self)
+
+        self.initialize_window()
+        self.initialize_audio(self.media_devices.defaultAudioInput())
+
+    def initialize_window(self):
+        self.layout = QHBoxLayout(self)
+
+        ### 监测声音状态条
+        self.m_canvas = RenderArea(self)
+        self.layout.addWidget(self.m_canvas)
+
+        ### 设备多选框
+        self.m_device_box = QComboBox(self)
+        
+        ## 默认设备与其他设备：方法1
+        # for audio_input in self.media_devices.audioInputs():
+        #     self.m_device_box.addItem(audio_input.description(), audio_input)
+        # default_audio_input = self.media_devices.audioInputs()[0]
+        # if not default_audio_input.isFormatSupported(self.audio_format):
+        #     qWarning("Default format not supported - trying to use nearest")
+        #     self.audio_format = default_audio_input.nearestFormat(self.audio_format)
+
+        
+        ## 默认设备与其他设备：方法2
+        # 默认设备
+        default_audio_input = self.media_devices.defaultAudioInput()
+        self.m_device_box.addItem(
+            default_audio_input.description(), default_audio_input
+        )
+        # 其他设备
+        for audio_input in self.media_devices.audioInputs():
+            if default_audio_input != audio_input:
+                self.m_device_box.addItem(audio_input.description(), audio_input)
+        
+
+        self.m_device_box.activated[int].connect(self.device_changed)
+        self.layout.addWidget(self.m_device_box)
+
+        ### 调节音量大小的滑动条
+        self.m_volume_slider = QSlider(Qt.Horizontal, self)
+        self.m_volume_slider.setRange(0, 100)
+        self.m_volume_slider.setValue(100)
+        self.m_volume_slider.valueChanged.connect(self.slider_changed)
+        self.layout.addWidget(self.m_volume_slider)
+
+        ### 暂停/恢复
+        self.m_suspend_resume_button = QPushButton(self)
+        self.m_suspend_resume_button.clicked.connect(self.toggle_suspend)
+        self.layout.addWidget(self.m_suspend_resume_button)
+
+    def initialize_audio(self, audio_device: QAudioDevice):
+        ##### 音频信息 AudioInfo
+        self.m_audio_info = AudioInfo(self.audio_format)
+
+        ##### 音频输入 QAudioSource
+        # 绑定音频设备和音频格式
+        self.audio_source = QAudioSource(audio_device, self.audio_format)
+        # 将声音的音量和slider联系在一起
+        initial_volume = QAudio.convertVolume(
+            self.audio_source.volume(),
+            QAudio.LinearVolumeScale,
+            QAudio.LogarithmicVolumeScale,
+        )
+        self.m_volume_slider.setValue(int(round(initial_volume * 100)))
+
+        
+        # 停止输入
+        self.audio_source.stop()
+        # 从 StoppedState 激活到 ActivateState
+        self.toggle_suspend()
+
+        # QIODevice
+        # 输入启动
+        io_device = self.audio_source.start()
+
+        def push_mode_slot():
+            length = self.audio_source.bytesAvailable()
+            # 这是个缓存机制，保证实时性
+            buffer_size = 4096
+            # length = min(length, buffer_size)
+            if length > buffer_size:
+                length = buffer_size
+            # 从 QIODevice 中读取
+            buffer: QByteArray = io_device.read(length)
+            # 实时事件
+            if length > 0:
+                level = self.m_audio_info.calculate_level(buffer)
+                self.m_canvas.set_level(level)
+        
+        # io_device 准备好连接
+        io_device.readyRead.connect(push_mode_slot)
+
+    @Slot()
+    def toggle_suspend(self):
+        # toggle suspend/resume
+        state = self.audio_source.state()
+        if (state == QAudio.SuspendedState) or (state == QAudio.StoppedState):
+            self.audio_source.resume()
+            self.m_suspend_resume_button.setText("Suspend recording")
+        elif state == QAudio.ActiveState:
+            self.audio_source.suspend()
+            self.m_suspend_resume_button.setText("Resume recording")
+        # else no-op
+
+    @Slot(int)
+    def device_changed(self, index):
+        ### 解联和重新初始化，是因为 QAudioSource 需要重新绑定音频设备
+        # 先停止音频输入
+        self.audio_source.stop()
+        # 解联
+        self.audio_source.disconnect(self)
+        # 重新初始化
+        self.initialize_audio(self.m_device_box.itemData(index))
+
+    @Slot(int)
+    def slider_changed(self, value):
+        # 调节音量
+        linearVolume = QAudio.convertVolume(
+            value / float(100), QAudio.LogarithmicVolumeScale, QAudio.LinearVolumeScale
+        )
+        self.audio_source.setVolume(linearVolume)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("Audio Sources Example")
+    input = InputTest()
+    input.show()
+    app.exec()
